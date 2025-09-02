@@ -2,3 +2,8 @@ fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
+sqlalchemy>=2.0
+aiosqlite
+passlib[bcrypt]
+python-jose[cryptography]
+
