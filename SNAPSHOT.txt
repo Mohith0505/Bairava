@@ -1,0 +1,267 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.api.routes.health import router as health_router
+from app.api.routes import auth as auth_routes
+from app.api.routes import users as users_routes
+from app.infra.db import init_models
+from app.api.routes import accounts, orders, positions
+#from app.api.routes import trades  # <- add near other imports
+
+#app = FastAPI(title=settings.APP_NAME, version="0.1.0")
+app = FastAPI(title="Bairava API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173","http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+def on_startup():
+    init_models()
+
+
+@app.get("/")
+async def root():
+    return {"ok": True, "app": "Bairava API"}
+
+# routers
+app.include_router(health_router, prefix="/api", tags=["health"])
+app.include_router(auth_routes.router, prefix="/api/auth", tags=["auth"])
+app.include_router(users_routes.router, prefix="/api/users", tags=["users"])
+app.include_router(accounts.router, prefix="/api/accounts", tags=["accounts"])
+app.include_router(orders.router,   prefix="/api/orders",   tags=["orders"])
+app.include_router(positions.router, prefix="/api/positions", tags=["positions"])
+#app.include_router(trades.router, prefix="/api/trades", tags=["trades"])
+
+--- backend/app/api/routes/auth.py ---
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from jose import jwt, JWTError
+
+from app.infra.db import get_db
+from app.domain.models.user import User
+from app.domain.schemas.auth import SignupIn, LoginIn, TokenOut
+from app.core.security import hash_password, verify_password, create_access_token
+from app.config import settings
+
+router = APIRouter()
+
+@router.post("/signup", response_model=dict)
+async def signup(payload: SignupIn, db: AsyncSession = Depends(get_db)):
+    # check existing
+    res = await db.execute(select(User).where(User.email == payload.email))
+    if res.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    u = User(email=payload.email, hashed_password=hash_password(payload.password))
+    db.add(u)
+    await db.commit()
+    return {"ok": True}
+
+@router.post("/token", response_model=TokenOut)
+async def token(payload: LoginIn, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(User).where(User.email == payload.email))
+    u = res.scalar_one_or_none()
+    if not u or not verify_password(payload.password, u.hashed_password):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    tok = create_access_token(str(u.id))
+    return TokenOut(access_token=tok)
+
+--- backend/app/api/routes/users.py ---
+from fastapi import APIRouter, Depends, HTTPException, status, Header
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from jose import jwt, JWTError
+
+from app.config import settings
+from app.infra.db import get_db
+from app.domain.models.user import User
+from app.domain.schemas.auth import MeOut
+
+router = APIRouter()
+
+async def get_current_user(authorization: str = Header(None), db: AsyncSession = Depends(get_db)) -> User:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    token = authorization.split()[1]
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user_id = int(sub)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    res = await db.execute(select(User).where(User.id == user_id))
+    u = res.scalar_one_or_none()
+    if not u or not u.is_active:
+        raise HTTPException(status_code=403, detail="User disabled")
+    return u
+
+@router.get("/me", response_model=MeOut)
+async def me(current: User = Depends(get_current_user)):
+    return MeOut(id=current.id, email=current.email, is_active=current.is_active, role=current.role)
+
+--- backend/app/api/routes/orders.py ---
+# backend/app/api/routes/orders.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from typing import List, Optional
+
+from app.infra.db import get_db
+from app.domain.models.trading import Account, Order
+from app.domain.schemas.orders import OrderCreate, OrderOut
+from app.domain.services.paper import apply_fill
+
+# Try to import a sync log_trade; if your project has only async, we’ll skip it gracefully.
+try:
+    from app.domain.services.trade_logger import log_trade  # type: ignore
+    _HAS_LOGGER = True
+except Exception:
+    _HAS_LOGGER = False
+
+router = APIRouter()
+
+def _account_or_400(db: Session, account_id: int) -> Account:
+    acc = db.get(Account, account_id)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if not acc.enabled:
+        raise HTTPException(status_code=400, detail="Account disabled")
+    return acc
+
+@router.get("", response_model=List[OrderOut])
+def list_orders(db: Session = Depends(get_db)):
+    q = db.execute(select(Order).order_by(Order.id.desc()))
+    return q.scalars().all()
+
+@router.get("/{order_id}", response_model=Optional[OrderOut])
+def get_order(order_id: int, db: Session = Depends(get_db)):
+    return db.get(Order, order_id)
+
+@router.post("", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+def create_order(payload: OrderCreate, db: Session = Depends(get_db)):
+    _account_or_400(db, payload.account_id)
+
+    ord_obj = Order(
+        account_id=payload.account_id,
+        symbol=payload.symbol.upper().strip(),
+        side=payload.side,
+        qty=int(payload.qty),
+        price=float(payload.price) if payload.price is not None else None,
+        status="NEW",
+    )
+    db.add(ord_obj)
+    db.flush()  # assign ord_obj.id
+
+    # Paper fill immediately
+    fill_price = ord_obj.price if ord_obj.price is not None else 100.0
+    apply_fill(db, ord_obj.account_id, ord_obj.symbol, ord_obj.side, ord_obj.qty, fill_price)
+
+    # Mark as filled
+    ord_obj.status = "FILLED"
+
+    # Optional trade log (only if available and synchronous)
+    if _HAS_LOGGER:
+        try:
+            # If your log_trade expects user_id, adapt accordingly (None for now)
+            log_trade(
+                db=db,
+                user_id=None,  # TODO: pass actual user if/when auth is wired here
+                account_id=payload.account_id,
+                order_id=ord_obj.id,
+                symbol=ord_obj.symbol,
+                side=ord_obj.side,
+                qty=ord_obj.qty,
+                price=fill_price,
+                action="FILLED",
+            )
+        except TypeError:
+            # If your log_trade is async or has a different signature, skip silently
+            pass
+
+    db.commit()
+    db.refresh(ord_obj)
+    return ord_obj
+
+@router.post("/{order_id}/cancel", response_model=OrderOut)
+def cancel_order(order_id: int, db: Session = Depends(get_db)):
+    o = db.get(Order, order_id)
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if o.status != "NEW":
+        raise HTTPException(status_code=400, detail=f"Cannot cancel in status {o.status}")
+    o.status = "CANCELED"
+    db.commit()
+    db.refresh(o)
+    return o
+
+--- backend/app/api/routes/accounts.py ---
+# backend/app/api/routes/accounts.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from typing import List
+
+from app.infra.db import get_db
+from app.domain.models.trading import Account
+from app.domain.schemas.accounts import AccountCreate, AccountOut
+
+router = APIRouter()
+
+@router.get("", response_model=List[AccountOut])
+def list_accounts(db: Session = Depends(get_db)):
+    q = db.execute(select(Account).order_by(Account.id))
+    return q.scalars().all()
+
+@router.post("", response_model=AccountOut, status_code=status.HTTP_201_CREATED)
+def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
+    acc = Account(broker=payload.broker, label=payload.label, enabled=True)
+    db.add(acc)
+    db.commit()
+    db.refresh(acc)
+    return acc
+
+@router.patch("/{account_id}", response_model=AccountOut)
+def update_account(account_id: int, payload: AccountCreate, db: Session = Depends(get_db)):
+    acc = db.get(Account, account_id)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    acc.broker = payload.broker or acc.broker
+    acc.label = payload.label or acc.label
+    db.commit()
+    db.refresh(acc)
+    return acc
+
+--- backend/app/api/routes/positions.py ---
+# backend/app/api/routes/positions.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from typing import List, Dict
+
+from app.infra.db import get_db
+from app.domain.models.trading import Position
+
+router = APIRouter()
+
+def _to_out(p: Position) -> Dict:
+    return {
+        "id": p.id,
+        "account_id": p.account_id,
+        "symbol": p.symbol,
+        "qty": p.qty,
+        "avg_price": p.avg_price,
+    }
+
+@router.get("", response_model=List[dict])
+def list_positions(db: Session = Depends(get_db)):
+    q = db.execute(select(Position).order_by(Position.id))
+    return [_to_out(p) for p in q.scalars().all()]
